@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+import copy
 from dataclasses import dataclass
 import gc
 from http import HTTPStatus
@@ -80,6 +81,8 @@ class _InferenceContext:
     model_params: dict[str, Any]
     parsers_result: Any
     prompt_progress_callback: Any = None
+    checkpoint_position: int | None = None
+    checkpoint_callback: Any = None
 
 
 class MLXLMHandler:
@@ -223,6 +226,65 @@ class MLXLMHandler:
 
         return [{k: v for k, v in message.items() if v is not None} for message in messages]
 
+    def _compute_checkpoint_boundary(
+        self,
+        messages: list[dict[str, Any]],
+        input_ids: list[int],
+        chat_template_kwargs: dict[str, Any],
+    ) -> int | None:
+        """Find the token position where the last user message begins.
+
+        Uses a sentinel substitution technique: replaces the last user message
+        with a short dummy string, tokenizes both the original and sentinel
+        versions, and compares token-by-token to find the divergence point.
+
+        This avoids issues where ``apply_chat_template(messages[:-1])``
+        produces tokens that don't form a prefix of the full prompt due to
+        template-specific formatting.
+
+        Parameters
+        ----------
+        messages : list[dict[str, Any]]
+            The refined chat messages.
+        input_ids : list[int]
+            Token IDs for the full prompt.
+        chat_template_kwargs : dict[str, Any]
+            Kwargs passed to the chat template (tools, etc.).
+
+        Returns
+        -------
+        int | None
+            Token index where the last user message content begins, or
+            ``None`` if no meaningful boundary can be computed.
+        """
+        if len(messages) < 2:
+            return None
+        if messages[-1].get("role") != "user":
+            return None
+
+        sentinel_messages = messages[:-1] + [{"role": "user", "content": "x"}]
+        try:
+            sentinel_prompt = self.model.create_input_prompt(
+                sentinel_messages, dict(chat_template_kwargs)
+            )
+            sentinel_ids = self.model.encode_prompt(sentinel_prompt)
+        except Exception:
+            logger.debug("Could not compute checkpoint boundary via sentinel substitution")
+            return None
+
+        common = 0
+        for a, b in zip(input_ids, sentinel_ids):
+            if a != b:
+                break
+            common += 1
+
+        if common > 0:
+            user_msg_length = len(input_ids) - common
+            if user_msg_length > 0:
+                return common
+
+        return None
+
     async def _build_inference_context(self, request: ChatCompletionRequest) -> "_InferenceContext":
         """Build the common inference context shared by stream and non-stream paths.
 
@@ -246,8 +308,41 @@ class MLXLMHandler:
         # new cache entries [B,X,Y,Z] instead of updating [A,B,X,Y,Z].
         cache_key = input_ids[:]
 
+        checkpoint_position: int | None = None
+        checkpoint_callback = None
+
         if cache is None:
             cache = self.model.create_prompt_cache()
+
+            # For hybrid models with non-trimmable caches (e.g. Qwen3.5,
+            # Nemotron-H, Jamba), the "longer cache trim" path in
+            # fetch_nearest_cache is blocked because ArraysCache state
+            # cannot be trimmed.  Save a checkpoint at the last-message
+            # boundary so subsequent requests with the same prefix can
+            # reuse the cached state via the "shorter" trie path.
+            if not self.model.cache_is_trimmable:
+                boundary = self._compute_checkpoint_boundary(
+                    refined_messages, input_ids, chat_template_kwargs
+                )
+                if boundary is not None:
+                    checkpoint_position = boundary
+                    prefix_ids = input_ids[:boundary]
+                    prompt_cache_ref = self.prompt_cache
+
+                    def checkpoint_callback(
+                        prompt_cache_state: list[Any],
+                        _prefix_ids: list[int] = prefix_ids,
+                        _store: Any = prompt_cache_ref,
+                    ) -> None:
+                        _store.insert_cache(
+                            _prefix_ids,
+                            copy.deepcopy(prompt_cache_state),
+                            checkpoint=True,
+                        )
+
+                    logger.info(
+                        f"Non-trimmable cache: will checkpoint prefix at {boundary} tokens"
+                    )
 
         total_input_tokens = len(input_ids)
         total_remaining_tokens = len(rest_input_ids)
@@ -283,6 +378,8 @@ class MLXLMHandler:
             model_params=model_params,
             parsers_result=parsers_result,
             prompt_progress_callback=prompt_progress_callback,
+            checkpoint_position=checkpoint_position,
+            checkpoint_callback=checkpoint_callback,
         )
 
     async def generate_text_stream(  # noqa: C901
@@ -314,6 +411,9 @@ class MLXLMHandler:
                 "prompt_progress_callback": ctx.prompt_progress_callback,
                 **model_params,
             }
+            if ctx.checkpoint_position is not None:
+                request_data["checkpoint_position"] = ctx.checkpoint_position
+                request_data["checkpoint_callback"] = ctx.checkpoint_callback
 
             if self.debug:
                 log_debug_request(request_data)
@@ -686,6 +786,9 @@ class MLXLMHandler:
                 "prompt_progress_callback": ctx.prompt_progress_callback,
                 **model_params,
             }
+            if ctx.checkpoint_position is not None:
+                request_data["checkpoint_position"] = ctx.checkpoint_position
+                request_data["checkpoint_callback"] = ctx.checkpoint_callback
 
             if self.debug:
                 log_debug_model_dispatch("mlx_lm.generate_text_response.submit", request_data)

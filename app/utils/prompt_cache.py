@@ -168,15 +168,18 @@ class LRUPromptCache:
         longer = None
         common_prefix = index
         if index > 0:
+            # BFS guarantees the first cache hit is the shallowest (shortest
+            # extra tokens), so we can stop immediately instead of exploring
+            # the entire subtree.
             best = None
-            stack = [(current, [])]
-            while stack:
-                current, extra = stack.pop()
-                if "cache" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                else:
-                    stack.extend((current[tok], [*extra, tok]) for tok in current)
+            queue = deque([(current, [])])
+            while queue:
+                node, extra = queue.popleft()
+                if "cache" in node:
+                    best = extra
+                    break
+                for tok in node:
+                    queue.append((node[tok], [*extra, tok]))
             if best is not None:
                 longer = tokens_ids[:index] + best
 

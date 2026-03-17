@@ -6,7 +6,7 @@ from typing import Any
 from loguru import logger
 import mlx.core as mx
 from mlx_lm.generate import GenerationResponse, stream_generate
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import can_trim_prompt_cache, make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 from outlines.processors import JSONLogitsProcessor
@@ -82,6 +82,9 @@ class MLX_LM:
             self.model_type = self.model.model_type
             self.debug = debug
             self.outlines_tokenizer = OutlinesTransformerTokenizer(self.tokenizer)
+            initial_cache = make_prompt_cache(self.model)
+            self._cache_is_trimmable = can_trim_prompt_cache(initial_cache)
+            self._num_model_cache_layers = len(initial_cache)
             if chat_template_file:
                 if not os.path.exists(chat_template_file):
                     raise ValueError(f"Chat template file {chat_template_file} does not exist")
@@ -139,25 +142,111 @@ class MLX_LM:
         )
 
     def encode_prompt(self, input_prompt: str) -> list[int]:
+        """Encode a prompt string into token IDs.
+
+        Parameters
+        ----------
+        input_prompt : str
+            The prompt string to encode.
+
+        Returns
+        -------
+        list[int]
+            Token IDs for the prompt.
+        """
         return self.tokenizer.encode(input_prompt)
+
+    @property
+    def cache_is_trimmable(self) -> bool:
+        """Whether the model's prompt cache supports trimming.
+
+        Pure-attention models return ``True``; hybrid models with
+        ``ArraysCache`` (SSM/recurrent layers) return ``False``.
+        """
+        return self._cache_is_trimmable
+
+    def _prefill_cache(
+        self,
+        token_ids: list[int],
+        prompt_cache: list[Any],
+        prefill_step_size: int = 2048,
+    ) -> None:
+        """Process tokens through the model to warm up the prompt cache.
+
+        Parameters
+        ----------
+        token_ids : list[int]
+            Token IDs to prefill into the cache.
+        prompt_cache : list[Any]
+            Prompt cache to update in-place.
+        prefill_step_size : int, optional
+            Maximum chunk size per forward pass, by default 2048.
+        """
+        tokens = mx.array(token_ids)
+        n_model = self._num_model_cache_layers
+        model_cache = prompt_cache[:n_model]
+
+        remaining = tokens
+        while remaining.size > 0:
+            chunk = remaining[:prefill_step_size]
+            self.model(chunk[None], cache=model_cache)
+            mx.eval([c.state for c in model_cache])
+            remaining = remaining[prefill_step_size:]
+            if remaining.size > 0:
+                mx.clear_cache()
+
+        if self.draft_model:
+            draft_cache = prompt_cache[n_model:]
+            remaining = tokens
+            while remaining.size > 0:
+                chunk = remaining[:prefill_step_size]
+                self.draft_model(chunk[None], cache=draft_cache)
+                mx.eval([c.state for c in draft_cache])
+                remaining = remaining[prefill_step_size:]
+                if remaining.size > 0:
+                    mx.clear_cache()
 
     def __call__(
         self, input_ids: list[int], prompt_cache: list[Any] = None, stream: bool = False, **kwargs
     ) -> CompletionResponse | Generator[GenerationResponse, None, None]:
-        """
-        Generate text response from the model.
+        """Generate text response from the model.
 
-        Args:
-            messages (List[Dict[str, str]]): List of messages in the conversation.
-            stream (bool): Whether to stream the response.
-            **kwargs: Additional parameters for generation
-                - temperature: Sampling temperature (default: 0.0)
-                - top_p: Top-p sampling parameter (default: 1.0)
-                - seed: Random seed (default: 0)
-                - max_tokens: Maximum number of tokens to generate (default: 256)
-        """
+        Parameters
+        ----------
+        input_ids : list[int]
+            Token IDs for the input prompt.
+        prompt_cache : list[Any], optional
+            Pre-computed prompt cache for faster inference.
+        stream : bool, optional
+            Whether to stream the response, by default ``False``.
+        **kwargs
+            Additional generation parameters (temperature, max_tokens, etc.)
+            and optional checkpoint control parameters:
 
-        # Set default parameters if not provided (use 'is not None' to preserve valid 0 values)
+            - ``checkpoint_position`` (int | None): Token index at which to
+              split prefill and save a cache checkpoint.
+            - ``checkpoint_callback`` (callable | None): Called with the
+              prompt cache after processing the prefix so the caller can
+              persist a checkpoint.
+
+        Returns
+        -------
+        CompletionResponse | Generator[GenerationResponse, None, None]
+            Complete response or streaming generator.
+        """
+        checkpoint_position: int | None = kwargs.pop("checkpoint_position", None)
+        checkpoint_callback = kwargs.pop("checkpoint_callback", None)
+
+        if (
+            checkpoint_position is not None
+            and checkpoint_callback is not None
+            and prompt_cache is not None
+            and 0 < checkpoint_position < len(input_ids)
+        ):
+            self._prefill_cache(input_ids[:checkpoint_position], prompt_cache)
+            checkpoint_callback(prompt_cache)
+            input_ids = input_ids[checkpoint_position:]
+
         def _get(key, default):
             v = kwargs.get(key)
             return default if v is None else v
