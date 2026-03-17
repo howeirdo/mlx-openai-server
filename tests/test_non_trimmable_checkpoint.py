@@ -16,10 +16,10 @@ from unittest.mock import Mock
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Stubs — avoid importing real MLX / GPU modules in CI
 # ---------------------------------------------------------------------------
+
 
 def _install_fake_mlx_cache_module(
     monkeypatch: pytest.MonkeyPatch,
@@ -102,8 +102,8 @@ class TestNonTrimmableCacheReuse:
         cache = LRUPromptCache(max_size=10)
 
         prefix_tokens = [1, 2, 3, 4, 5]
-        full_request_1 = prefix_tokens + [10, 11, 12]
-        full_request_2 = prefix_tokens + [20, 21, 22]
+        full_request_1 = [*prefix_tokens, 10, 11, 12]
+        full_request_2 = [*prefix_tokens, 20, 21, 22]
 
         fake_prefix_cache = [Mock(nbytes=100, state=[])]
         fake_full_cache = [Mock(nbytes=200, state=[])]
@@ -166,13 +166,9 @@ class TestComputeCheckpointBoundary:
 
         mock_model = Mock()
 
-        def fake_create_input_prompt(
-            messages: list[dict], kwargs: dict
-        ) -> str:
+        def fake_create_input_prompt(messages: list[dict], kwargs: dict) -> str:
             kwargs.pop("_partial_mode", None)
-            parts = []
-            for m in messages:
-                parts.append(f"<|{m['role']}|>{m.get('content', '')}")
+            parts = [f"<|{m['role']}|>{m.get('content', '')}" for m in messages]
             parts.append("<|assistant|>")
             return "".join(parts)
 
@@ -184,9 +180,7 @@ class TestComputeCheckpointBoundary:
         handler.model = mock_model
         return handler
 
-    def test_boundary_found_for_two_messages(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_boundary_found_for_two_messages(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The boundary separates system tokens from user message content."""
         handler = self._make_handler(monkeypatch)
         messages = [
@@ -201,16 +195,14 @@ class TestComputeCheckpointBoundary:
         assert boundary is not None
         assert 0 < boundary < len(input_ids)
 
-        sentinel_messages = messages[:-1] + [{"role": "user", "content": "x"}]
+        sentinel_messages = [*messages[:-1], {"role": "user", "content": "x"}]
         sentinel_prompt = handler.model.create_input_prompt(sentinel_messages, {})
         sentinel_ids = handler.model.encode_prompt(sentinel_prompt)
 
         for i in range(boundary):
             assert input_ids[i] == sentinel_ids[i], f"Mismatch at position {i}"
 
-    def test_returns_none_for_single_message(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_for_single_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No checkpoint boundary when there's only one message."""
         handler = self._make_handler(monkeypatch)
         messages = [{"role": "user", "content": "Hello"}]
@@ -220,9 +212,7 @@ class TestComputeCheckpointBoundary:
         boundary = handler._compute_checkpoint_boundary(messages, input_ids, {})
         assert boundary is None
 
-    def test_returns_none_for_assistant_last_message(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_for_assistant_last_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No checkpoint when the last message is from the assistant."""
         handler = self._make_handler(monkeypatch)
         messages = [
@@ -235,9 +225,7 @@ class TestComputeCheckpointBoundary:
         boundary = handler._compute_checkpoint_boundary(messages, input_ids, {})
         assert boundary is None
 
-    def test_boundary_with_multi_turn_conversation(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_boundary_with_multi_turn_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Boundary is at the last user message, not earlier ones."""
         handler = self._make_handler(monkeypatch)
         messages = [
@@ -254,11 +242,11 @@ class TestComputeCheckpointBoundary:
         assert boundary is not None
 
         prefix_prompt = handler.model.create_input_prompt(
-            messages[:-1] + [{"role": "user", "content": "x"}], {}
+            [*messages[:-1], {"role": "user", "content": "x"}], {}
         )
         prefix_ids = handler.model.encode_prompt(prefix_prompt)
         common = 0
-        for a, b in zip(input_ids, prefix_ids):
+        for a, b in zip(input_ids, prefix_ids, strict=False):
             if a != b:
                 break
             common += 1
@@ -288,9 +276,7 @@ class TestComputeCheckpointBoundary:
         full_prompt = original(messages, {})
         input_ids = handler.model.encode_prompt(full_prompt)
 
-        handler.model.create_input_prompt = lambda m, k: (_ for _ in ()).throw(
-            ValueError("boom")
-        )
+        handler.model.create_input_prompt = lambda m, k: (_ for _ in ()).throw(ValueError("boom"))
         boundary = handler._compute_checkpoint_boundary(messages, input_ids, {})
         assert boundary is None
 
@@ -334,9 +320,13 @@ class TestModelCheckpointPrefill:
                 self.generation_tokens = 1
 
         fake_generate.GenerationResponse = _FakeGenResponse
-        fake_generate.stream_generate = Mock(return_value=iter([
-            _FakeGenResponse("hi", 99, "stop"),
-        ]))
+        fake_generate.stream_generate = Mock(
+            return_value=iter(
+                [
+                    _FakeGenResponse("hi", 99, "stop"),
+                ]
+            )
+        )
         monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
 
         fake_sample = types.ModuleType("mlx_lm.sample_utils")
@@ -388,9 +378,7 @@ class TestModelCheckpointPrefill:
 
         return model, fake_generate
 
-    def test_prefill_called_with_correct_prefix(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_prefill_called_with_correct_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``_prefill_cache`` receives exactly the prefix tokens up to checkpoint_position."""
         model, _ = self._make_model(monkeypatch)
 
@@ -410,9 +398,7 @@ class TestModelCheckpointPrefill:
         )
 
         # _prefill_cache should be called with the prefix [1,2,3,4,5]
-        model._prefill_cache.assert_called_once_with(
-            [1, 2, 3, 4, 5], fake_cache
-        )
+        model._prefill_cache.assert_called_once_with([1, 2, 3, 4, 5], fake_cache)
         assert saved_caches == ["called"]
 
     def test_stream_generate_receives_suffix_after_checkpoint(
@@ -434,12 +420,12 @@ class TestModelCheckpointPrefill:
 
         # stream_generate should receive the suffix [6, 7, 8]
         call_args = fake_generate.stream_generate.call_args
-        actual_input_ids = call_args[1].get("prompt") if "prompt" in (call_args[1] or {}) else call_args[0][2]
+        actual_input_ids = (
+            call_args[1].get("prompt") if "prompt" in (call_args[1] or {}) else call_args[0][2]
+        )
         assert list(actual_input_ids) == [6, 7, 8]
 
-    def test_no_prefill_when_position_is_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_prefill_when_position_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No checkpoint logic runs when position is None."""
         model, fake_generate = self._make_model(monkeypatch)
 
@@ -454,9 +440,7 @@ class TestModelCheckpointPrefill:
         actual_input_ids = call_args[0][2]
         assert list(actual_input_ids) == [1, 2, 3, 4, 5]
 
-    def test_no_prefill_when_position_out_of_range(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_prefill_when_position_out_of_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No checkpoint when position >= len(input_ids)."""
         model, _ = self._make_model(monkeypatch)
 
@@ -473,9 +457,7 @@ class TestModelCheckpointPrefill:
 
         model._prefill_cache.assert_not_called()
 
-    def test_no_prefill_when_cache_is_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_prefill_when_cache_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No checkpoint when prompt_cache is None."""
         model, _ = self._make_model(monkeypatch)
 
