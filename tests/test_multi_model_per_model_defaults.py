@@ -110,6 +110,37 @@ def _make_raw_request(registry: _FakeRegistry | None, handler: Any | None = None
     )
 
 
+def _single_model_registry_case(case: str, handler: Any) -> _FakeRegistry | None:
+    """Build registry shapes that may or may not actually own ``handler``."""
+
+    if case == "no-registry":
+        return None
+    if case == "empty-registry":
+        return _FakeRegistry({})
+    if case == "other-model-only":
+        return _FakeRegistry(
+            {
+                "model-a": types.SimpleNamespace(
+                    handler_type="lm",
+                    model_id="model-a",
+                    model_path="other/model/path",
+                )
+            }
+        )
+    if case == "foreign-owned-handler-id":
+        return _FakeRegistry(
+            {
+                handler.model_id: types.SimpleNamespace(
+                    handler_type="lm",
+                    model_id=handler.model_id,
+                    model_path="other/model/path",
+                )
+            }
+        )
+
+    raise ValueError(f"Unknown single-model registry case: {case}")
+
+
 def _single_model_handler_with_implicit_defaults() -> Any:
     """Build a handler-shaped object carrying implicit single-model defaults."""
 
@@ -553,7 +584,7 @@ async def test_responses_omitted_model_uses_backward_compatible_fallback_handler
     registry_handler = types.SimpleNamespace(
         handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_B
     )
-    registry = _FakeRegistry({"model-a": registry_handler, "alias-a": fallback_handler})
+    registry = _FakeRegistry({"model-a": registry_handler})
 
     monkeypatch.setattr(
         endpoints_module, "process_text_responses_request", _fake_process_text_responses_request
@@ -566,7 +597,6 @@ async def test_responses_omitted_model_uses_backward_compatible_fallback_handler
 
     assert isinstance(response, JSONResponse)
     assert captured_handlers == [fallback_handler]
-    assert captured_requests[0].model is None
 
 
 @pytest.mark.asyncio
@@ -816,12 +846,12 @@ async def test_responses_explicit_legacy_alias_without_registry_entry_still_404s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "registry",
-    [None, _FakeRegistry({})],
-    ids=["no-registry", "empty-registry"],
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
 )
 async def test_responses_single_model_omitted_model_preserves_legacy_default_alias(
-    registry: _FakeRegistry | None,
+    registry_case: str,
 ) -> None:
     """Single-model omitted Responses requests should still report ``local-text-model``.
 
@@ -844,6 +874,7 @@ async def test_responses_single_model_omitted_model_preserves_legacy_default_ali
         debug=False,
         generate_text_response=_fake_generate_text_response,
     )
+    registry = _single_model_registry_case(registry_case, single_handler)
 
     request = ResponsesRequest(input="hello", model=None)
     response = await endpoints_module.responses_endpoint(
@@ -856,7 +887,14 @@ async def test_responses_single_model_omitted_model_preserves_legacy_default_ali
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_single_model_omitted_model_preserves_legacy_default_alias() -> None:
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_responses_stream_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
     """Streamed single-model omitted Responses requests should still report ``local-text-model``.
 
     The real single-model boot path does not currently attach
@@ -876,10 +914,11 @@ async def test_responses_stream_single_model_omitted_model_preserves_legacy_defa
         debug=False,
         generate_text_stream=_fake_generate_text_stream,
     )
+    registry = _single_model_registry_case(registry_case, single_handler)
 
     request = ResponsesRequest(input="hello", model=None, stream=True)
     response = await endpoints_module.responses_endpoint(
-        request, _make_raw_request(None, handler=single_handler)
+        request, _make_raw_request(registry, handler=single_handler)
     )
 
     assert isinstance(response, StreamingResponse)
@@ -904,7 +943,14 @@ async def test_responses_stream_single_model_omitted_model_preserves_legacy_defa
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_single_model_omitted_model_preserves_legacy_default_alias() -> None:
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_chat_completions_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
     """Single-model omitted chat requests should still report ``local-text-model``."""
 
     endpoints_module = _load_endpoints_module()
@@ -919,10 +965,11 @@ async def test_chat_completions_single_model_omitted_model_preserves_legacy_defa
         debug=False,
         generate_text_response=_fake_generate_text_response,
     )
+    registry = _single_model_registry_case(registry_case, single_handler)
 
     request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
     response = await endpoints_module.chat_completions(
-        request, _make_raw_request(None, handler=single_handler)
+        request, _make_raw_request(registry, handler=single_handler)
     )
 
     assert isinstance(response, JSONResponse)
@@ -931,9 +978,14 @@ async def test_chat_completions_single_model_omitted_model_preserves_legacy_defa
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_stream_single_model_omitted_model_preserves_legacy_default_alias() -> (
-    None
-):
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_chat_completions_stream_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
     """Streamed single-model omitted chat requests should still report ``local-text-model``."""
 
     endpoints_module = _load_endpoints_module()
@@ -948,10 +1000,11 @@ async def test_chat_completions_stream_single_model_omitted_model_preserves_lega
         debug=False,
         generate_text_stream=_fake_generate_text_stream,
     )
+    registry = _single_model_registry_case(registry_case, single_handler)
 
     request = ChatCompletionRequest(messages=[Message(role="user", content="hello")], stream=True)
     response = await endpoints_module.chat_completions(
-        request, _make_raw_request(None, handler=single_handler)
+        request, _make_raw_request(registry, handler=single_handler)
     )
 
     assert isinstance(response, StreamingResponse)

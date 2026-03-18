@@ -135,7 +135,44 @@ def _resolve_handler(
     return getattr(raw_request.app.state, "handler", None)
 
 
+def _get_handler_registry_ownership(raw_request: Request, handler: Any) -> str:
+    """Classify whether the attached registry actually owns ``handler``.
+
+    Returns one of:
+
+    - ``owned`` when ``registry.get_handler(handler.model_id) is handler``
+    - ``different`` when that lookup succeeds but returns another object
+    - ``missing`` when the registry has no entry for ``handler.model_id``
+    - ``no-registry`` when no registry is attached
+    - ``no-model-id`` when the handler exposes no concrete ``model_id``
+    - ``no-get-handler`` when the attached registry-like object cannot
+      resolve handlers
+    """
+
+    registry = getattr(raw_request.app.state, "registry", None)
+    if registry is None:
+        return "no-registry"
+
+    handler_model_id = getattr(handler, "model_id", None)
+    if not handler_model_id:
+        return "no-model-id"
+
+    get_handler = getattr(registry, "get_handler", None)
+    if get_handler is None:
+        return "no-get-handler"
+
+    try:
+        registry_handler = get_handler(handler_model_id)
+    except KeyError:
+        return "missing"
+
+    if registry_handler is handler:
+        return "owned"
+    return "different"
+
+
 def _normalize_chat_response_model(
+    raw_request: Request,
     request: ChatCompletionRequest,
     handler: Any,
     *,
@@ -152,11 +189,18 @@ def _normalize_chat_response_model(
     lookups and can return ``model_not_found``.
 
     After an omitted-model fallback resolves to a concrete handler, chat
-    payloads should report the resolved handler id instead of the legacy
-    alias. Single-model requests keep the alias.
+    payloads should report the resolved handler id only when the
+    attached registry actually owns that handler. Single-model requests
+    and registry-like non-owning wrapper shapes keep the legacy alias.
     """
-    if used_legacy_chat_fallback:
+    if not used_legacy_chat_fallback:
+        return
+
+    if _get_handler_registry_ownership(raw_request, handler) == "owned":
         request.model = getattr(handler, "model_id", Config.TEXT_MODEL)
+        return
+
+    request.model = Config.TEXT_MODEL
 
 
 def _should_use_legacy_chat_fallback(
@@ -193,36 +237,15 @@ def _should_preserve_legacy_responses_model(
 ) -> bool:
     """Return whether Responses should keep the legacy single-model alias.
 
-    Omitted Responses requests report the resolved handler id in
-    multi-model compatibility-fallback mode, but preserve
-    ``Config.TEXT_MODEL`` when the resolved handler is effectively a
-    single-model fallback. Treat a request as effectively single-model
-    when no registry is attached, when the handler has no concrete
-    ``model_id``, or when a registry object exists but does not
-    actually own the resolved handler.
+    Omitted Responses requests preserve ``Config.TEXT_MODEL`` whenever
+    the attached registry does not actually own the resolved handler.
+    Only registry-owned handlers expose their concrete ``model_id``.
     """
 
     if request.model:
         return False
 
-    registry = getattr(raw_request.app.state, "registry", None)
-    if registry is None:
-        return True
-
-    handler_model_id = getattr(handler, "model_id", None)
-    if not handler_model_id:
-        return True
-
-    get_handler = getattr(registry, "get_handler", None)
-    if get_handler is None:
-        return True
-
-    try:
-        get_handler(handler_model_id)
-    except KeyError:
-        return True
-
-    return False
+    return _get_handler_registry_ownership(raw_request, handler) != "owned"
 
 
 # =============================================================================
@@ -479,6 +502,7 @@ async def chat_completions(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
         )
     _normalize_chat_response_model(
+        raw_request,
         request,
         handler,
         used_legacy_chat_fallback=used_legacy_chat_fallback,
