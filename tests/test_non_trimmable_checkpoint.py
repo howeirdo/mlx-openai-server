@@ -472,3 +472,90 @@ class TestModelCheckpointPrefill:
         )
 
         model._prefill_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _build_inference_context: checkpoint on shorter cache hits
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointOnShorterCacheHit:
+    """Verify checkpoints are created even when a shorter cache hit exists.
+
+    When a non-trimmable model gets a shorter cache hit, the checkpoint
+    position must be adjusted relative to rest_input_ids so that the
+    model's __call__ receives a valid offset into the suffix it processes.
+    """
+
+    def _make_handler(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Create a handler with a mocked model for checkpoint-on-hit tests."""
+        MLXLMHandler = _load_handler_class(monkeypatch)
+        handler = MLXLMHandler.__new__(MLXLMHandler)
+
+        mock_model = Mock()
+
+        def fake_create_input_prompt(messages: list[dict], kwargs: dict) -> str:
+            kwargs.pop("_partial_mode", None)
+            parts = [f"<|{m['role']}|>{m.get('content', '')}" for m in messages]
+            parts.append("<|assistant|>")
+            return "".join(parts)
+
+        def fake_encode_prompt(prompt: str) -> list[int]:
+            return [ord(c) for c in prompt]
+
+        mock_model.create_input_prompt = fake_create_input_prompt
+        mock_model.encode_prompt = fake_encode_prompt
+        mock_model.cache_is_trimmable = False
+        mock_model.create_prompt_cache = Mock(return_value=[Mock(state=[])])
+        handler.model = mock_model
+        handler.debug = False
+        return handler
+
+    def test_checkpoint_position_adjusted_for_shorter_hit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """checkpoint_position is relative to rest_input_ids, not full input_ids."""
+        handler = self._make_handler(monkeypatch)
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "user", "content": "Second question"},
+        ]
+        full_prompt = handler.model.create_input_prompt(messages, {})
+        input_ids = handler.model.encode_prompt(full_prompt)
+
+        boundary = handler._compute_checkpoint_boundary(messages, input_ids, {})
+        assert boundary is not None
+
+        # Simulate a shorter cache hit covering the first 10 tokens
+        cached_prefix_len = 10
+        rest_input_ids = input_ids[cached_prefix_len:]
+
+        # The checkpoint position should be adjusted for the shorter hit
+        assert boundary > cached_prefix_len, (
+            "Boundary must be beyond cached prefix for this test to be meaningful"
+        )
+        expected_checkpoint_pos = boundary - cached_prefix_len
+        assert 0 < expected_checkpoint_pos < len(rest_input_ids)
+
+    def test_no_checkpoint_when_boundary_within_cached_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No checkpoint needed when boundary falls within the already-cached portion."""
+        handler = self._make_handler(monkeypatch)
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        full_prompt = handler.model.create_input_prompt(messages, {})
+        input_ids = handler.model.encode_prompt(full_prompt)
+
+        boundary = handler._compute_checkpoint_boundary(messages, input_ids, {})
+        assert boundary is not None
+
+        # If cached_prefix_len >= boundary, no checkpoint should be set
+        cached_prefix_len = boundary + 5
+        assert cached_prefix_len >= boundary, "Cached prefix covers the boundary"

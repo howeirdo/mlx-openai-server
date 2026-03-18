@@ -314,33 +314,40 @@ class MLXLMHandler:
         if cache is None:
             cache = self.model.create_prompt_cache()
 
-            # For hybrid models with non-trimmable caches (e.g. Qwen3.5,
-            # Nemotron-H, Jamba), the "longer cache trim" path in
-            # fetch_nearest_cache is blocked because ArraysCache state
-            # cannot be trimmed.  Save a checkpoint at the last-message
-            # boundary so subsequent requests with the same prefix can
-            # reuse the cached state via the "shorter" trie path.
-            if not self.model.cache_is_trimmable:
-                boundary = self._compute_checkpoint_boundary(
-                    refined_messages, input_ids, chat_template_kwargs
-                )
-                if boundary is not None:
-                    checkpoint_position = boundary
-                    prefix_ids = input_ids[:boundary]
-                    prompt_cache_ref = self.prompt_cache
+        # For hybrid models with non-trimmable caches (e.g. Qwen3.5,
+        # Nemotron-H, Jamba), the "longer cache trim" path in
+        # fetch_nearest_cache is blocked because ArraysCache state
+        # cannot be trimmed.  Save a checkpoint at the last-message
+        # boundary so subsequent requests with the same prefix can
+        # reuse the cached state via the "shorter" trie path.
+        #
+        # This runs on EVERY request (not just cache misses) so that
+        # multi-turn conversations accumulate checkpoints at each new
+        # message boundary, rather than only at the first request's.
+        if not self.model.cache_is_trimmable:
+            boundary = self._compute_checkpoint_boundary(
+                refined_messages, input_ids, chat_template_kwargs
+            )
+            cached_prefix_len = len(input_ids) - len(rest_input_ids)
+            if boundary is not None and boundary > cached_prefix_len:
+                # checkpoint_position is relative to rest_input_ids
+                # (which is what the model receives as input_ids).
+                checkpoint_position = boundary - cached_prefix_len
+                prefix_ids = input_ids[:boundary]
+                prompt_cache_ref = self.prompt_cache
 
-                    def checkpoint_callback(
-                        prompt_cache_state: list[Any],
-                        _prefix_ids: list[int] = prefix_ids,
-                        _store: Any = prompt_cache_ref,
-                    ) -> None:
-                        _store.insert_cache(
-                            _prefix_ids,
-                            copy.deepcopy(prompt_cache_state),
-                            checkpoint=True,
-                        )
+                def checkpoint_callback(
+                    prompt_cache_state: list[Any],
+                    _prefix_ids: list[int] = prefix_ids,
+                    _store: Any = prompt_cache_ref,
+                ) -> None:
+                    _store.insert_cache(
+                        _prefix_ids,
+                        copy.deepcopy(prompt_cache_state),
+                        checkpoint=True,
+                    )
 
-                    logger.info(f"Non-trimmable cache: will checkpoint prefix at {boundary} tokens")
+                logger.info(f"Non-trimmable cache: will checkpoint prefix at {boundary} tokens")
 
         total_input_tokens = len(input_ids)
         total_remaining_tokens = len(rest_input_ids)
