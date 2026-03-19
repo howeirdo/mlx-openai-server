@@ -225,7 +225,10 @@ def _should_use_legacy_chat_fallback(
     try:
         registry.get_handler(Config.TEXT_MODEL)
     except KeyError:
-        return getattr(raw_request.app.state, "handler", None) is not None
+        fallback_handler = getattr(raw_request.app.state, "handler", None)
+        if fallback_handler is None:
+            return False
+        return _get_handler_type(fallback_handler) in ("lm", "multimodal")
 
     return False
 

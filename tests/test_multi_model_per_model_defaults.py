@@ -639,6 +639,44 @@ async def test_chat_completions_omitted_model_uses_backward_compatible_fallback_
 
 
 @pytest.mark.asyncio
+async def test_chat_completions_omitted_model_does_not_fallback_to_non_chat_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted chat requests should not route to a non-chat fallback handler."""
+
+    endpoints_module = _load_endpoints_module()
+    captured_handlers: list[Any] = []
+
+    async def _fake_process_text_request(
+        handler: Any,
+        request: ChatCompletionRequest,
+        request_id: str | None = None,
+    ) -> JSONResponse:
+        del request, request_id
+        captured_handlers.append(handler)
+        return JSONResponse(content={"ok": True})
+
+    fallback_handler = types.SimpleNamespace(handler_type="embeddings")
+    registry_handler = types.SimpleNamespace(
+        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_A
+    )
+    registry = _FakeRegistry({"model-a": registry_handler})
+
+    monkeypatch.setattr(endpoints_module, "process_text_request", _fake_process_text_request)
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await endpoints_module.chat_completions(
+            request, _make_raw_request(registry, handler=fallback_handler)
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["error"]["type"] == "model_not_found"
+    assert captured_handlers == []
+
+
+@pytest.mark.asyncio
 async def test_chat_completions_omitted_model_reports_resolved_fallback_model_id() -> None:
     """Omitted-model chat requests should report the resolved fallback handler's model id."""
 
