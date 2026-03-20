@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import sys
 import types
 from typing import Any
 
-from fastapi.responses import JSONResponse
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 import pytest
 
 from app.config import MLXServerConfig, load_config_from_yaml
-from app.schemas.openai import ChatCompletionRequest, Message, ResponsesRequest
+from app.schemas.openai import ChatCompletionRequest, Config, Message, ResponsesRequest
 
 PER_MODEL_DEFAULTS_A: dict[str, int | float] = {
     "default_temperature": 1.0,
@@ -99,13 +101,44 @@ class _FakeRegistry:
         return self._handlers[model_id]
 
 
-def _make_raw_request(registry: _FakeRegistry, handler: Any | None = None) -> Any:
+def _make_raw_request(registry: _FakeRegistry | None, handler: Any | None = None) -> Any:
     """Build a minimal request-like object for endpoint unit tests."""
 
     return types.SimpleNamespace(
         app=types.SimpleNamespace(state=types.SimpleNamespace(registry=registry, handler=handler)),
         state=types.SimpleNamespace(request_id="req-test"),
     )
+
+
+def _single_model_registry_case(case: str, handler: Any) -> _FakeRegistry | None:
+    """Build registry shapes that may or may not actually own ``handler``."""
+
+    if case == "no-registry":
+        return None
+    if case == "empty-registry":
+        return _FakeRegistry({})
+    if case == "other-model-only":
+        return _FakeRegistry(
+            {
+                "model-a": types.SimpleNamespace(
+                    handler_type="lm",
+                    model_id="model-a",
+                    model_path="other/model/path",
+                )
+            }
+        )
+    if case == "foreign-owned-handler-id":
+        return _FakeRegistry(
+            {
+                handler.model_id: types.SimpleNamespace(
+                    handler_type="lm",
+                    model_id=handler.model_id,
+                    model_path="other/model/path",
+                )
+            }
+        )
+
+    raise ValueError(f"Unknown single-model registry case: {case}")
 
 
 def _single_model_handler_with_implicit_defaults() -> Any:
@@ -543,9 +576,15 @@ async def test_responses_omitted_model_uses_backward_compatible_fallback_handler
         return JSONResponse(content={"ok": True})
 
     fallback_handler = types.SimpleNamespace(
-        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_A
+        handler_type="lm",
+        model_id="alias-a",
+        _uses_model_sampling_defaults=True,
+        **PER_MODEL_DEFAULTS_A,
     )
-    registry = _FakeRegistry({"model-a": fallback_handler})
+    registry_handler = types.SimpleNamespace(
+        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_B
+    )
+    registry = _FakeRegistry({"model-a": registry_handler})
 
     monkeypatch.setattr(
         endpoints_module, "process_text_responses_request", _fake_process_text_responses_request
@@ -558,4 +597,469 @@ async def test_responses_omitted_model_uses_backward_compatible_fallback_handler
 
     assert isinstance(response, JSONResponse)
     assert captured_handlers == [fallback_handler]
-    assert captured_requests[0].model is None
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_omitted_model_uses_backward_compatible_fallback_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted-model chat requests should still fall back to app.state.handler."""
+
+    endpoints_module = _load_endpoints_module()
+    captured_requests: list[ChatCompletionRequest] = []
+    captured_handlers: list[Any] = []
+
+    async def _fake_process_text_request(
+        handler: Any,
+        request: ChatCompletionRequest,
+        request_id: str | None = None,
+    ) -> JSONResponse:
+        del request_id
+        captured_handlers.append(handler)
+        captured_requests.append(request.model_copy(deep=True))
+        return JSONResponse(content={"ok": True})
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_A
+    )
+    registry_handler = types.SimpleNamespace(
+        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_B
+    )
+    registry = _FakeRegistry({"model-a": registry_handler})
+
+    monkeypatch.setattr(endpoints_module, "process_text_request", _fake_process_text_request)
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
+    response = await endpoints_module.chat_completions(
+        request, _make_raw_request(registry, handler=fallback_handler)
+    )
+
+    assert isinstance(response, JSONResponse)
+    assert captured_handlers == [fallback_handler]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_omitted_model_does_not_fallback_to_non_chat_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted chat requests should not route to a non-chat fallback handler."""
+
+    endpoints_module = _load_endpoints_module()
+    captured_handlers: list[Any] = []
+
+    async def _fake_process_text_request(
+        handler: Any,
+        request: ChatCompletionRequest,
+        request_id: str | None = None,
+    ) -> JSONResponse:
+        del request, request_id
+        captured_handlers.append(handler)
+        return JSONResponse(content={"ok": True})
+
+    fallback_handler = types.SimpleNamespace(handler_type="embeddings")
+    registry_handler = types.SimpleNamespace(
+        handler_type="lm", _uses_model_sampling_defaults=True, **PER_MODEL_DEFAULTS_A
+    )
+    registry = _FakeRegistry({"model-a": registry_handler})
+
+    monkeypatch.setattr(endpoints_module, "process_text_request", _fake_process_text_request)
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await endpoints_module.chat_completions(
+            request, _make_raw_request(registry, handler=fallback_handler)
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["error"]["type"] == "model_not_found"
+    assert captured_handlers == []
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_omitted_model_reports_resolved_fallback_model_id() -> None:
+    """Omitted-model chat requests should report the resolved fallback handler's model id."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
+    response = await endpoints_module.chat_completions(
+        request, _make_raw_request(registry, handler=fallback_handler)
+    )
+
+    assert isinstance(response, JSONResponse)
+    payload = json.loads(response.body)
+    assert payload["model"] == "alias-a"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_stream_omitted_model_reports_resolved_fallback_model_id() -> None:
+    """Streamed omitted-model chat requests should report the resolved fallback handler id."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_stream(_chat_request: Any) -> Any:
+        yield "hello"
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_stream=_fake_generate_text_stream,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")], stream=True)
+    response = await endpoints_module.chat_completions(
+        request, _make_raw_request(registry, handler=fallback_handler)
+    )
+
+    assert isinstance(response, StreamingResponse)
+    body_chunks = [
+        chunk.decode() if isinstance(chunk, bytes) else chunk
+        async for chunk in response.body_iterator
+    ]
+
+    events: list[dict[str, Any]] = []
+    for item in "".join(body_chunks).split("\n\n"):
+        if not item.startswith("data: "):
+            continue
+        payload = item.removeprefix("data: ")
+        if payload == "[DONE]":
+            continue
+        events.append(json.loads(payload))
+
+    model_values = [event["model"] for event in events if "model" in event]
+    assert model_values
+    assert set(model_values) == {"alias-a"}
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_explicit_legacy_alias_without_registry_entry_still_404s() -> None:
+    """Explicit ``local-text-model`` should still be treated as an invalid model id."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ChatCompletionRequest(
+        model=Config.TEXT_MODEL,
+        messages=[Message(role="user", content="hello")],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await endpoints_module.chat_completions(
+            request, _make_raw_request(registry, handler=fallback_handler)
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["error"]["type"] == "model_not_found"
+
+
+@pytest.mark.asyncio
+async def test_responses_omitted_model_reports_resolved_fallback_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted-model Responses should report the resolved fallback handler's model id."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ResponsesRequest(input="hello", model=None)
+    response = await endpoints_module.responses_endpoint(
+        request, _make_raw_request(registry, handler=fallback_handler)
+    )
+
+    assert isinstance(response, JSONResponse)
+    payload = json.loads(response.body)
+    assert payload["model"] == "alias-a"
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_omitted_model_reports_resolved_fallback_model_id() -> None:
+    """Streamed omitted-model Responses should report the resolved fallback handler id."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_stream(_chat_request: Any) -> Any:
+        yield "hello"
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_stream=_fake_generate_text_stream,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ResponsesRequest(input="hello", model=None, stream=True)
+    response = await endpoints_module.responses_endpoint(
+        request, _make_raw_request(registry, handler=fallback_handler)
+    )
+
+    assert isinstance(response, StreamingResponse)
+    body_chunks = [
+        chunk.decode() if isinstance(chunk, bytes) else chunk
+        async for chunk in response.body_iterator
+    ]
+
+    events_by_type: dict[str, dict[str, Any]] = {}
+    for item in "".join(body_chunks).split("\n\n"):
+        for line in item.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line.removeprefix("data: ")
+            event = json.loads(payload)
+            event_type = event.get("type")
+            if event_type in {"response.created", "response.completed"}:
+                events_by_type[event_type] = event
+
+    assert events_by_type["response.created"]["response"]["model"] == "alias-a"
+    assert events_by_type["response.completed"]["response"]["model"] == "alias-a"
+
+
+@pytest.mark.asyncio
+async def test_responses_explicit_legacy_alias_without_registry_entry_still_404s() -> None:
+    """Explicit ``local-text-model`` should still 404 for Responses when not registered."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    fallback_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="alias-a",
+        model_path="mlx-community/model-a-4bit",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _FakeRegistry({"alias-a": fallback_handler})
+
+    request = ResponsesRequest(input="hello", model=Config.TEXT_MODEL)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await endpoints_module.responses_endpoint(
+            request, _make_raw_request(registry, handler=fallback_handler)
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail["error"]["type"] == "model_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_responses_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
+    """Single-model omitted Responses requests should still report ``local-text-model``.
+
+    The real single-model boot path does not currently attach
+    ``handler.model_id``. This test includes one anyway so the contract
+    stays pinned if a future handler or proxy refactor adds that field.
+    """
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    # Guard against future single-model handler/proxy refactors that
+    # expose a concrete model_id while the API contract stays legacy.
+    single_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="actual-single-id",
+        model_path="actual/model/path",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _single_model_registry_case(registry_case, single_handler)
+
+    request = ResponsesRequest(input="hello", model=None)
+    response = await endpoints_module.responses_endpoint(
+        request, _make_raw_request(registry, handler=single_handler)
+    )
+
+    assert isinstance(response, JSONResponse)
+    payload = json.loads(response.body)
+    assert payload["model"] == Config.TEXT_MODEL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_responses_stream_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
+    """Streamed single-model omitted Responses requests should still report ``local-text-model``.
+
+    The real single-model boot path does not currently attach
+    ``handler.model_id``. This test includes one anyway so the stream
+    path stays aligned if that changes later.
+    """
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_stream(_chat_request: Any) -> Any:
+        yield "hello"
+
+    single_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="actual-single-id",
+        model_path="actual/model/path",
+        debug=False,
+        generate_text_stream=_fake_generate_text_stream,
+    )
+    registry = _single_model_registry_case(registry_case, single_handler)
+
+    request = ResponsesRequest(input="hello", model=None, stream=True)
+    response = await endpoints_module.responses_endpoint(
+        request, _make_raw_request(registry, handler=single_handler)
+    )
+
+    assert isinstance(response, StreamingResponse)
+    body_chunks = [
+        chunk.decode() if isinstance(chunk, bytes) else chunk
+        async for chunk in response.body_iterator
+    ]
+
+    events_by_type: dict[str, dict[str, Any]] = {}
+    for item in "".join(body_chunks).split("\n\n"):
+        for line in item.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line.removeprefix("data: ")
+            event = json.loads(payload)
+            event_type = event.get("type")
+            if event_type in {"response.created", "response.completed"}:
+                events_by_type[event_type] = event
+
+    assert events_by_type["response.created"]["response"]["model"] == Config.TEXT_MODEL
+    assert events_by_type["response.completed"]["response"]["model"] == Config.TEXT_MODEL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_chat_completions_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
+    """Single-model omitted chat requests should still report ``local-text-model``."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_response(_chat_request: Any) -> dict[str, Any]:
+        return {"response": "hello", "usage": None}
+
+    single_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="actual-single-id",
+        model_path="actual/model/path",
+        debug=False,
+        generate_text_response=_fake_generate_text_response,
+    )
+    registry = _single_model_registry_case(registry_case, single_handler)
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")])
+    response = await endpoints_module.chat_completions(
+        request, _make_raw_request(registry, handler=single_handler)
+    )
+
+    assert isinstance(response, JSONResponse)
+    payload = json.loads(response.body)
+    assert payload["model"] == Config.TEXT_MODEL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registry_case",
+    ["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+    ids=["no-registry", "empty-registry", "other-model-only", "foreign-owned-handler-id"],
+)
+async def test_chat_completions_stream_single_model_omitted_model_preserves_legacy_default_alias(
+    registry_case: str,
+) -> None:
+    """Streamed single-model omitted chat requests should still report ``local-text-model``."""
+
+    endpoints_module = _load_endpoints_module()
+
+    async def _fake_generate_text_stream(_chat_request: Any) -> Any:
+        yield "hello"
+
+    single_handler = types.SimpleNamespace(
+        handler_type="lm",
+        model_id="actual-single-id",
+        model_path="actual/model/path",
+        debug=False,
+        generate_text_stream=_fake_generate_text_stream,
+    )
+    registry = _single_model_registry_case(registry_case, single_handler)
+
+    request = ChatCompletionRequest(messages=[Message(role="user", content="hello")], stream=True)
+    response = await endpoints_module.chat_completions(
+        request, _make_raw_request(registry, handler=single_handler)
+    )
+
+    assert isinstance(response, StreamingResponse)
+    body_chunks = [
+        chunk.decode() if isinstance(chunk, bytes) else chunk
+        async for chunk in response.body_iterator
+    ]
+
+    events: list[dict[str, Any]] = []
+    for item in "".join(body_chunks).split("\n\n"):
+        if not item.startswith("data: "):
+            continue
+        payload = item.removeprefix("data: ")
+        if payload == "[DONE]":
+            continue
+        events.append(json.loads(payload))
+
+    model_values = [event["model"] for event in events if "model" in event]
+    assert model_values
+    assert set(model_values) == {Config.TEXT_MODEL}

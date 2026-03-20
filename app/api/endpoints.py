@@ -113,6 +113,7 @@ def _resolve_handler(
     HTTPException
         404 when a ``model_id`` is provided but not found in the
         registry.
+
     """
     registry = getattr(raw_request.app.state, "registry", None)
     if registry is not None and model_id is not None:
@@ -132,6 +133,122 @@ def _resolve_handler(
 
     # Fallback: single-handler mode
     return getattr(raw_request.app.state, "handler", None)
+
+
+def _get_handler_registry_ownership(raw_request: Request, handler: Any) -> str:
+    """Classify whether the attached registry actually owns ``handler``.
+
+    Returns one of:
+
+    - ``owned`` when ``registry.get_handler(handler.model_id) is handler``
+    - ``different`` when that lookup succeeds but returns another object
+    - ``missing`` when the registry has no entry for ``handler.model_id``
+    - ``no-registry`` when no registry is attached
+    - ``no-model-id`` when the handler exposes no concrete ``model_id``
+    - ``no-get-handler`` when the attached registry-like object cannot
+      resolve handlers
+    """
+
+    registry = getattr(raw_request.app.state, "registry", None)
+    if registry is None:
+        return "no-registry"
+
+    handler_model_id = getattr(handler, "model_id", None)
+    if not handler_model_id:
+        return "no-model-id"
+
+    get_handler = getattr(registry, "get_handler", None)
+    if get_handler is None:
+        return "no-get-handler"
+
+    try:
+        registry_handler = get_handler(handler_model_id)
+    except KeyError:
+        return "missing"
+
+    if registry_handler is handler:
+        return "owned"
+    return "different"
+
+
+def _normalize_chat_response_model(
+    raw_request: Request,
+    request: ChatCompletionRequest,
+    handler: Any,
+    *,
+    used_legacy_chat_fallback: bool,
+) -> None:
+    """Normalize the chat response model after handler resolution.
+
+    Chat requests normalize omitted ``model`` to ``Config.TEXT_MODEL``
+    during validation. In multi-model mode we preserve backward
+    compatibility for omitted requests by resolving them against
+    ``app.state.handler`` when the field was not explicitly supplied.
+    ``model_fields_set`` preserves that distinction, so explicit
+    ``model="local-text-model"`` requests still behave like normal model
+    lookups and can return ``model_not_found``.
+
+    After an omitted-model fallback resolves to a concrete handler, chat
+    payloads should report the resolved handler id only when the
+    attached registry actually owns that handler. Single-model requests
+    and registry-like non-owning wrapper shapes keep the legacy alias.
+    """
+    if not used_legacy_chat_fallback:
+        return
+
+    if _get_handler_registry_ownership(raw_request, handler) == "owned":
+        request.model = getattr(handler, "model_id", Config.TEXT_MODEL)
+        return
+
+    request.model = Config.TEXT_MODEL
+
+
+def _should_use_legacy_chat_fallback(
+    raw_request: Request,
+    request: ChatCompletionRequest,
+) -> bool:
+    """Return whether chat should use omitted-model fallback routing.
+
+    The backward-compatible fallback only applies when the ``model``
+    field was omitted, the request normalized to ``Config.TEXT_MODEL``,
+    the alias is not registered in multi-model mode, and
+    ``app.state.handler`` is available as the compatibility fallback.
+    """
+
+    if request.model != Config.TEXT_MODEL or "model" in request.model_fields_set:
+        return False
+
+    registry = getattr(raw_request.app.state, "registry", None)
+    if registry is None:
+        return False
+
+    try:
+        registry.get_handler(Config.TEXT_MODEL)
+    except KeyError:
+        fallback_handler = getattr(raw_request.app.state, "handler", None)
+        if fallback_handler is None:
+            return False
+        return _get_handler_type(fallback_handler) in ("lm", "multimodal")
+
+    return False
+
+
+def _should_preserve_legacy_responses_model(
+    raw_request: Request,
+    request: ResponsesRequest,
+    handler: Any,
+) -> bool:
+    """Return whether Responses should keep the legacy single-model alias.
+
+    Omitted Responses requests preserve ``Config.TEXT_MODEL`` whenever
+    the attached registry does not actually own the resolved handler.
+    Only registry-owned handlers expose their concrete ``model_id``.
+    """
+
+    if request.model:
+        return False
+
+    return _get_handler_registry_ownership(raw_request, handler) != "owned"
 
 
 # =============================================================================
@@ -373,7 +490,11 @@ async def chat_completions(
     """Handle chat completion requests."""
     if not request.model:
         request.model = Config.TEXT_MODEL
-    handler = _resolve_handler(raw_request, model_id=request.model)
+    used_legacy_chat_fallback = _should_use_legacy_chat_fallback(raw_request, request)
+    handler = _resolve_handler(
+        raw_request,
+        model_id=None if used_legacy_chat_fallback else request.model,
+    )
     if handler is None:
         return JSONResponse(
             content=create_error_response(
@@ -383,6 +504,12 @@ async def chat_completions(
             ),
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
         )
+    _normalize_chat_response_model(
+        raw_request,
+        request,
+        handler,
+        used_legacy_chat_fallback=used_legacy_chat_fallback,
+    )
     request = refine_chat_completion_request(request, handler)
 
     handler_type = _get_handler_type(handler)
@@ -1390,7 +1517,7 @@ def refine_responses_request(
             handler, "default_max_tokens", "DEFAULT_MAX_TOKENS", _parse_env_int
         )
     if not request.model:
-        request.model = Config.TEXT_MODEL
+        request.model = getattr(handler, "model_id", Config.TEXT_MODEL)
     return request
 
 
@@ -1789,6 +1916,12 @@ async def responses_endpoint(
             ),
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
         )
+
+    if _should_preserve_legacy_responses_model(raw_request, request, handler):
+        # Single-model mode preserves the legacy alias even if a future
+        # handler/proxy refactor adds a concrete ``model_id`` attribute,
+        # or a registry-like object is attached without owning it.
+        request.model = Config.TEXT_MODEL
 
     handler_type = _get_handler_type(handler)
     if handler_type not in ("lm", "multimodal"):
