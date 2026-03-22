@@ -258,9 +258,7 @@ class ModelRegistry:
         int
             Number of registered models.
         """
-        return len(self._handlers) + len(
-            self._on_demand_configs.keys() - self._handlers.keys()
-        )
+        return len(self._handlers) + len(self._on_demand_configs.keys() - self._handlers.keys())
 
     # ------------------------------------------------------------------
     # On-demand (dynamic swapping) support
@@ -361,9 +359,7 @@ class ModelRegistry:
                 if self._on_demand_idle_task is not None:
                     self._on_demand_idle_task.cancel()
                     self._on_demand_idle_task = None
-                self._on_demand_ref_count[model_id] = (
-                    self._on_demand_ref_count.get(model_id, 0) + 1
-                )
+                self._on_demand_ref_count[model_id] = self._on_demand_ref_count.get(model_id, 0) + 1
                 logger.debug(
                     f"On-demand model '{model_id}' already loaded, "
                     f"ref_count={self._on_demand_ref_count[model_id]}"
@@ -418,9 +414,7 @@ class ModelRegistry:
         if model_id not in self._on_demand_configs:
             return
 
-        self._on_demand_ref_count[model_id] = max(
-            0, self._on_demand_ref_count.get(model_id, 1) - 1
-        )
+        self._on_demand_ref_count[model_id] = max(0, self._on_demand_ref_count.get(model_id, 1) - 1)
         logger.debug(
             f"Released on-demand model '{model_id}', "
             f"ref_count={self._on_demand_ref_count[model_id]}"
@@ -430,9 +424,7 @@ class ModelRegistry:
             timeout = self._on_demand_idle_timeouts.get(model_id, 60)
             if self._on_demand_idle_task is not None:
                 self._on_demand_idle_task.cancel()
-            self._on_demand_idle_task = asyncio.create_task(
-                self._idle_unload(model_id, timeout)
-            )
+            self._on_demand_idle_task = asyncio.create_task(self._idle_unload(model_id, timeout))
 
     async def _idle_unload(self, model_id: str, timeout: int) -> None:
         """Unload an on-demand model after it has been idle.
@@ -444,9 +436,7 @@ class ModelRegistry:
         timeout : int
             Seconds to wait before unloading.
         """
-        logger.info(
-            f"On-demand model '{model_id}' idle timer started ({timeout}s)"
-        )
+        logger.info(f"On-demand model '{model_id}' idle timer started ({timeout}s)")
         await asyncio.sleep(timeout)
 
         async with self._on_demand_load_lock:

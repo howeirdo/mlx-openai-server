@@ -170,9 +170,7 @@ def create_lifespan(config_args: MLXServerConfig):
             model_cfg = config_args.to_model_entry_config()
             ensure_image_handler_available(model_cfg.model_type)
 
-            logger.info(
-                f"Initializing MLX handler with model path: {model_cfg.model_path}"
-            )
+            logger.info(f"Initializing MLX handler with model path: {model_cfg.model_path}")
 
             handler = create_handler_from_config(model_cfg)
             await handler.initialize(
@@ -186,9 +184,7 @@ def create_lifespan(config_args: MLXServerConfig):
             # in the request ``model`` field when --served-model-name is set.
             if config_args.served_model_name:
                 handler.model_path = config_args.served_model_name
-                logger.info(
-                    f"Serving model as '{config_args.served_model_name}'"
-                )
+                logger.info(f"Serving model as '{config_args.served_model_name}'")
 
             logger.info("MLX handler initialized successfully")
             app.state.handler = handler

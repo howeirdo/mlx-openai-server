@@ -147,7 +147,7 @@ class MLXServerConfig:
         """
         return self.model_path
 
-    def to_model_entry_config(self) -> "ModelEntryConfig":
+    def to_model_entry_config(self) -> ModelEntryConfig:
         """Convert this single-model CLI config to a ``ModelEntryConfig``.
 
         This allows ``create_handler_from_config`` to be reused for

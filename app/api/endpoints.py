@@ -144,9 +144,12 @@ async def _resolve_handler(
                 ) from exc
 
         # Model not found at all
-        available = ", ".join(
-            sorted(set(registry._handlers.keys()) | set(registry._on_demand_configs.keys()))
-        ) or "(none)"
+        available = (
+            ", ".join(
+                sorted(set(registry._handlers.keys()) | set(registry._on_demand_configs.keys()))
+            )
+            or "(none)"
+        )
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail={
@@ -249,7 +252,9 @@ def _normalize_request_model(raw_request: Request, request: Any, handler: Any) -
     into the request so that response payloads (including stream
     chunks) carry the correct model identifier.
     """
-    if request.model == Config.TEXT_MODEL and "model" not in getattr(request, "model_fields_set", set()):
+    if request.model == Config.TEXT_MODEL and "model" not in getattr(
+        request, "model_fields_set", set()
+    ):
         registry = getattr(raw_request.app.state, "registry", None)
         if registry is None:
             request.model = getattr(handler, "model_path", request.model)
