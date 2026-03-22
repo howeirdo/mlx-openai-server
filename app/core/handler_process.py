@@ -438,7 +438,9 @@ class HandlerProcessProxy:
             name=f"handler-{self.served_model_name}",
         )
         self._process.start()
-        logger.info(f"Spawned handler process for '{self.served_model_name}' (pid={self._process.pid})")
+        logger.info(
+            f"Spawned handler process for '{self.served_model_name}' (pid={self._process.pid})"
+        )
 
         # Wait for the ready signal.
         ready_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
