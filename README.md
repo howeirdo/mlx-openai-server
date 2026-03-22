@@ -253,9 +253,11 @@ models:
     served_model_name: glm-4.7-flash
 
   # Loaded on first request, unloaded after 120s idle
-  - model_path: mlx-community/Qwen3.5-32B-4bit
-    model_type: lm
-    served_model_name: qwen3.5-32b
+  - model_path: black-forest-labs/FLUX.2-klein-4B
+    model_type: image-generation
+    config_name: flux2-klein-4b
+    quantize: 4
+    served_model_name: flux2-klein-4b
     on_demand: true
     on_demand_idle_timeout: 120
 ```
