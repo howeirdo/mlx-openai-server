@@ -11,9 +11,6 @@ A high-performance OpenAI-compatible API server for MLX models. Run text, vision
 
 ## Table of Contents
 
-<details>
-<summary>Click to expand</summary>
-
 - [5-Second Quick Start](#5-second-quick-start)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -23,18 +20,15 @@ A high-performance OpenAI-compatible API server for MLX models. Run text, vision
   - [Dynamic Model Swapping](#dynamic-model-swapping-on-demand-loading)
 - [Supported Model Types](#supported-model-types)
 - [Common Use Cases](#common-use-cases)
-- [Featured Launch: MiniMax-M2.5-Uncensored-4bit](#featured-launch-minimax-m25-uncensored-4bit)
 - [Using the API](#using-the-api)
 - [Advanced Configuration](#advanced-configuration)
-- [Request Queue System](#request-queue-system)
 - [Example Notebooks](#example-notebooks)
 - [Large Models](#large-models)
 - [Troubleshooting](#troubleshooting)
 - [Quick Reference Card](#quick-reference-card)
+- [Featured Launch: MiniMax-M2.5-Uncensored-4bit](#featured-launch-minimax-m25-uncensored-4bit)
 - [Contributing](#contributing)
 - [Support](#support)
-
-</details>
 
 ---
 
@@ -155,6 +149,8 @@ mlx-openai-server launch \
 | `--prompt-cache-size` | No | int | 10 | Maximum number of prompt KV cache entries to store |
 | `--max-bytes` | No | int | (unbounded) | Maximum total bytes retained by prompt KV caches before eviction |
 | | | | | **Server options** |
+| `--host` | No | string | `127.0.0.1` | Host address to bind the server to |
+| `--port` | No | int | `8000` | Port to run the server on |
 | `--served-model-name` | No | string | — | Override the model name returned by `/v1/models` and accepted in request `model` field |
 | | | | | **Advanced options** |
 | `--lora-paths` | No | string | — | Comma-separated LoRA adapter paths (image models) |
@@ -307,7 +303,7 @@ import openai
 
 client = openai.OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 
-# Use the first model (qwen2.5-7b)
+# Use the first model (glm-4.7-flash)
 r1 = client.chat.completions.create(
     model="glm-4.7-flash",
     messages=[{"role": "user", "content": "Say hello in one word."}],
@@ -367,37 +363,23 @@ print(r2.choices[0].message.content)
 
 ---
 
-## Featured Launch: MiniMax-M2.5-Uncensored-4bit
-
-Want a frontier-style assistant on Apple Silicon without the usual heavyweight setup? [mlx-community/MiniMax-M2.5-Uncensored-4bit](https://huggingface.co/mlx-community/MiniMax-M2.5-Uncensored-4bit) is a 4-bit quantized, uncensored MiniMax-M2.5 release that pairs especially well with `mlx-openai-server` for coding, tool use, search, and agent-style workflows.
-
-This is one of the most compelling demos of what the server can do: OpenAI-compatible serving, streaming, structured outputs, and native support for MiniMax reasoning and tool-call parsing in one local stack.
-
-### Launch It in One Command
-
-```bash
-mlx-openai-server launch \
-  --model-path mlx-community/MiniMax-M2.5-Uncensored-4bit \
-  --model-type lm \
-  --reasoning-parser minimax_m2 \
-  --tool-call-parser minimax_m2 \
-  --trust-remote-code
-```
-
-Once it is running, point your OpenAI client to `http://localhost:8000/v1` and use it like any other chat-completions endpoint.
-
-### Why This Model Stands Out
-
-- **4-bit efficiency** for lower memory use and faster local inference
-- **Uncensored behavior** for research, creative, and less-filtered assistant use cases
-- **MiniMax-native parsing** with `minimax_m2` for cleaner reasoning and tool-call handling
-- **Drop-in compatibility** with OpenAI SDKs, OpenWebUI, and agent frameworks
-
----
-
 ## Using the API
 
-The server provides OpenAI-compatible endpoints. Use standard OpenAI client libraries:
+The server provides OpenAI-compatible endpoints. Use standard OpenAI client libraries.
+
+> **Model name in requests:** The `model` field should be the model path you passed to `--model-path` (e.g. `mlx-community/Qwen3-Coder-Next-4bit`), the `--served-model-name` you set, or the `model_id` from your YAML config. No API key is required — use any non-empty string (e.g. `"not-needed"`).
+
+### Supported Endpoints
+
+| Endpoint | Model Types | Description |
+|----------|-------------|-------------|
+| `POST /v1/chat/completions` | lm, multimodal | Chat completions (streaming supported) |
+| `POST /v1/responses` | lm, multimodal | OpenAI Responses API |
+| `POST /v1/images/generations` | image-generation | Image generation |
+| `POST /v1/images/edits` | image-edit | Image editing |
+| `POST /v1/embeddings` | embeddings | Text embeddings |
+| `POST /v1/audio/transcriptions` | whisper | Audio transcription |
+| `GET /v1/models` | all | List available models |
 
 ### Text Completion
 
@@ -789,6 +771,32 @@ mlx-openai-server launch --model-type whisper --model-path mlx-community/whisper
 
 ---
 
+## Featured Launch: MiniMax-M2.5-Uncensored-4bit
+
+Want a frontier-style assistant on Apple Silicon without the usual heavyweight setup? [mlx-community/MiniMax-M2.5-Uncensored-4bit](https://huggingface.co/mlx-community/MiniMax-M2.5-Uncensored-4bit) is a 4-bit quantized, uncensored MiniMax-M2.5 release that pairs especially well with `mlx-openai-server` for coding, tool use, search, and agent-style workflows.
+
+### Launch It in One Command
+
+```bash
+mlx-openai-server launch \
+  --model-path mlx-community/MiniMax-M2.5-Uncensored-4bit \
+  --model-type lm \
+  --reasoning-parser minimax_m2 \
+  --tool-call-parser minimax_m2 \
+  --trust-remote-code
+```
+
+Once it is running, point your OpenAI client to `http://localhost:8000/v1` and use it like any other chat-completions endpoint.
+
+### Why This Model Stands Out
+
+- **4-bit efficiency** for lower memory use and faster local inference
+- **Uncensored behavior** for research, creative, and less-filtered assistant use cases
+- **MiniMax-native parsing** with `minimax_m2` for cleaner reasoning and tool-call handling
+- **Drop-in compatibility** with OpenAI SDKs, OpenWebUI, and agent frameworks
+
+---
+
 ## Contributing
 
 We welcome contributions! Please:
@@ -806,26 +814,6 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/) for commit m
 - **Issues**: [GitHub Issues](https://github.com/cubist38/mlx-openai-server/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/cubist38/mlx-openai-server/discussions)
 - **Video Tutorials**: [Setup Demo](https://youtu.be/J1gkEMvmTSE), [RAG Demo](https://youtu.be/ANUEZkmR-0s), [Testing Qwen3-Coder-Next-4bit with Qwen-Code](https://youtu.be/X5Hsd3QR_E8), [Serving Multiple Models at Once? mlx-openai-server + OpenWebUI Test](https://www.youtube.com/watch?v=f7WXSOPZ5H4)
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-Built on top of:
-- [MLX](https://github.com/ml-explore/mlx) - Apple's ML framework
-- [mlx-lm](https://github.com/ml-explore/mlx-lm) - Language models
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) - Multimodal models
-- [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Embeddings
-- [mflux](https://github.com/filipstrand/mflux) - Flux image models
-- [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) - Audio transcription
-- [mlx-community](https://huggingface.co/mlx-community) - Model repository
-
----
-
-[![GitHub stars](https://img.shields.io/github/stars/cubist38/mlx-openai-server?style=social&label=Star)](https://github.com/cubist38/mlx-openai-server)
-WXSOPZ5H4)
 
 ## License
 
