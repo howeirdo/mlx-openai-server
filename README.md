@@ -202,28 +202,20 @@ server:
 
 models:
   # Language model
-  - model_path: mlx-community/GLM-4.7-Flash-8bit
+  - model_path: mlx-community/MiniMax-M2.5-4bit
     model_type: lm
-    served_model_name: glm-4.7-flash    # optional alias (defaults to model_path)
+    served_model_name: Minimax-M2.5    # optional alias (defaults to model_path)
     enable_auto_tool_choice: true
-    tool_call_parser: glm4_moe
-    reasoning_parser: glm47_flash
-
-  # Another language model
-  - model_path: mlx-community/Qwen3-Coder-Next-4bit
-    model_type: lm
-    tool_call_parser: qwen3_coder
-
-
-  - model_path: mlx-community/Qwen3-VL-2B-Instruct-4bit
-    model_type: multimodal
-    tool_call_parser: qwen3_vl
+    tool_call_parser: minimax_m2
+    reasoning_parser: minimax_m2
 
   - model_path: black-forest-labs/FLUX.2-klein-4B
     model_type: image-generation
     config_name: flux2-klein-4b
     quantize: 4
     served_model_name: flux2-klein-4b
+    on_demand: true
+    on_demand_idle_timeout: 120  # seconds before unloading (default: 60)
 ```
 
 A full example is in `examples/config.yaml`.
