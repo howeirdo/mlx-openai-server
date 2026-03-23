@@ -7,10 +7,15 @@ import mlx.core as mx
 from mlx_vlm import load, stream_generate
 from mlx_vlm.models.cache import make_prompt_cache
 from mlx_vlm.video_generate import process_vision_info
-from outlines.processors import JSONLogitsProcessor
+try:
+    from outlines.processors import JSONLogitsProcessor
+    from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
+    HAS_OUTLINES = True
+except ImportError:
+    JSONLogitsProcessor = None
+    OutlinesTransformerTokenizer = None
+    HAS_OUTLINES = False
 import torch
-
-from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
 from ..utils.prompt_cache import LRUPromptCache
 
 # Default model parameters
@@ -77,7 +82,7 @@ class MLX_VLM:
             )
             self.config = self.model.config
             self.context_length = context_length
-            self.outlines_tokenizer = OutlinesTransformerTokenizer(self.processor.tokenizer)
+            self.outlines_tokenizer = OutlinesTransformerTokenizer(self.processor.tokenizer) if HAS_OUTLINES else None
             if chat_template_file:
                 if not os.path.exists(chat_template_file):
                     raise ValueError(f"Chat template file {chat_template_file} does not exist")
@@ -142,7 +147,7 @@ class MLX_VLM:
         # Handle JSON schema for structured outputs
         json_schema = kwargs.get("schema")
         logits_processors = []
-        if json_schema:
+        if json_schema and HAS_OUTLINES:
             logits_processors.append(
                 JSONLogitsProcessor(
                     schema=json_schema, tokenizer=self.outlines_tokenizer, tensor_library_name="mlx"

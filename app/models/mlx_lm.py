@@ -9,10 +9,16 @@ from mlx_lm.generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import can_trim_prompt_cache, make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
-from outlines.processors import JSONLogitsProcessor
+try:
+    from outlines.processors import JSONLogitsProcessor
+    from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
+    HAS_OUTLINES = True
+except ImportError:
+    JSONLogitsProcessor = None
+    OutlinesTransformerTokenizer = None
+    HAS_OUTLINES = False
 
 from ..utils.debug_logging import log_debug_chat_template
-from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
 
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
 DEFAULT_TOP_P = float(os.getenv("DEFAULT_TOP_P", "0.95"))
@@ -81,7 +87,7 @@ class MLX_LM:
             self.bos_token = self.tokenizer.bos_token
             self.model_type = self.model.model_type
             self.debug = debug
-            self.outlines_tokenizer = OutlinesTransformerTokenizer(self.tokenizer)
+            self.outlines_tokenizer = OutlinesTransformerTokenizer(self.tokenizer) if HAS_OUTLINES else None
             initial_cache = make_prompt_cache(self.model)
             self._cache_is_trimmable = can_trim_prompt_cache(initial_cache)
             self._num_model_cache_layers = len(initial_cache)
@@ -286,7 +292,7 @@ class MLX_LM:
         )
 
         json_schema = kwargs.get("schema")
-        if json_schema:
+        if json_schema and HAS_OUTLINES:
             logits_processors.append(
                 JSONLogitsProcessor(
                     schema=json_schema, tokenizer=self.outlines_tokenizer, tensor_library_name="mlx"
