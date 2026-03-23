@@ -3,7 +3,7 @@ name = "mlx-openai-server"
 version = "1.7.0"
 description = "A high-performance API server that provides OpenAI-compatible endpoints for MLX models."
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
 authors = [{ name = "Gia-Huy Vuong", email = "cubist38@gmail.com" }]
 keywords = [
